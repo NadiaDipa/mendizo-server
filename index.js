@@ -3,258 +3,512 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
+import { randomBytes } from "node:crypto";
 import Stripe from "stripe";
+import { fromNodeHeaders } from "better-auth/node";
+import { auth } from "./auth.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ─── Stripe setup ───────────────────────────────────────────────────────────
-// STRIPE_SECRET_KEY must be set in .env (get from Stripe Dashboard → test mode)
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
-  : null;
+const CLIENT_URL = (
+  process.env.CLIENT_URL ||
+  process.env.BETTER_AUTH_URL ||
+  "http://localhost:3000"
+).replace(/\/+$/, "");
 
-// ─── MongoDB setup ───────────────────────────────────────────────────────────
 if (!process.env.MONGODB_URI) {
   throw new Error("MONGODB_URI is missing in .env file");
 }
 
+if (!process.env.BETTER_AUTH_SECRET) {
+  throw new Error("BETTER_AUTH_SECRET is missing in .env file");
+}
+
+// ─── Stripe setup ───────────────────────────────────────────────────────────
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+
+// ─── MongoDB setup ──────────────────────────────────────────────────────────
+
 const client = new MongoClient(process.env.MONGODB_URI);
 
-// Module-level collection references, populated after connection
-let usersCol, servicesCol, bookingsCol, paymentsCol, sessionsCol;
+let usersCol;
+let servicesCol;
+let bookingsCol;
+let paymentsCol;
 
 async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("Successfully connected to MongoDB!");
+  await client.connect();
 
-    const database = client.db("mendizo");
+  console.log("Successfully connected to MongoDB!");
 
-    // Assign collections to module-level variables so routes can use them
-    usersCol    = database.collection("user");
-    servicesCol = database.collection("services");
-    bookingsCol = database.collection("bookings");
-    paymentsCol = database.collection("payments");
-    sessionsCol = database.collection("session");
-  } catch (error) {
-    console.error("MongoDB connection failed:", error);
-    throw error;
-  }
-}
+  const database = client.db("mendizo");
 
-// ─── Helper: parse a cookie string ──────────────────────────────────────────
-// Returns the value of a named cookie from the Cookie header string
-function parseCookie(cookieHeader, name) {
-  if (!cookieHeader) return null;
-  const parts = cookieHeader.split(";");
-  for (const part of parts) {
-    const [key, ...rest] = part.trim().split("=");
-    if (key.trim() === name) {
-      return decodeURIComponent(rest.join("=").trim());
+  usersCol = database.collection("user");
+  servicesCol = database.collection("services");
+  bookingsCol = database.collection("bookings");
+  paymentsCol = database.collection("payments");
+
+  await paymentsCol.createIndex(
+    { stripeSessionId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: {
+        stripeSessionId: { $type: "string" },
+      },
     }
-  }
-  return null;
+  );
+
+  console.log("MongoDB indexes are ready!");
 }
 
-// ─── Auth Middleware ─────────────────────────────────────────────────────────
-// Verifies that the request comes from a logged-in customer using Better Auth
-// session stored in MongoDB. Sets req.userId on success.
+// ─── Helper: validate MongoDB ObjectId ──────────────────────────────────────
+
+function isValidObjectId(id) {
+  return typeof id === "string" && /^[a-fA-F0-9]{24}$/.test(id);
+}
+
+// ─── Helper: find document by ObjectId or string ID ─────────────────────────
+
+async function findByIdOrString(collection, id) {
+  if (!id) return null;
+
+  if (id instanceof ObjectId) {
+    return collection.findOne({ _id: id });
+  }
+
+  if (typeof id === "string" && isValidObjectId(id)) {
+    const document = await collection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (document) return document;
+  }
+
+  return collection.findOne({ _id: id });
+}
+
+// ─── Customer Authentication Middleware ─────────────────────────────────────
+
 async function requireCustomer(req, res, next) {
   try {
-    // 1. Read session token from cookie
-    const token = parseCookie(req.headers.cookie, "better-auth.session_token");
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
 
-    // 2. Look up session in MongoDB by token field
-    const session = await sessionsCol.findOne({ token });
-    if (!session) return res.status(401).json({ error: "Unauthorized" });
-
-    // 3. Check expiry
-    if (new Date(session.expiresAt) <= new Date()) {
-      return res.status(401).json({ error: "Unauthorized" });
+    if (!session?.user) {
+      return res.status(401).json({
+        error: "Unauthorized. Please log in.",
+      });
     }
 
-    // 4. Find the user by the session's userId (stored as string id field)
-    const user = await usersCol.findOne({ id: session.userId });
-    if (!user) return res.status(401).json({ error: "Unauthorized" });
-
-    // 5. Only allow customers
-    if (user.role !== "customer") {
-      return res.status(401).json({ error: "Unauthorized" });
+    if (session.user.role !== "customer") {
+      return res.status(403).json({
+        error: "Access denied. Customer account required.",
+      });
     }
 
-    // 6. Attach userId to request and continue
-    req.userId = user.id;
-    next();
-  } catch (err) {
-    console.error("requireCustomer error:", err);
-    res.status(401).json({ error: "Unauthorized" });
+    req.userId = session.user.id;
+
+    return next();
+  } catch (error) {
+    console.error("Customer authentication error:", error);
+
+    return res.status(500).json({
+      error: "Unable to verify authentication.",
+    });
   }
 }
 
-// ─── Webhook route MUST be before express.json() ────────────────────────────
-// Raw body is required for Stripe signature verification
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
+// ─── Technician Authentication Middleware ───────────────────────────────────
 
-    if (!stripe) {
-      console.error("Stripe not configured");
-      return res.status(500).json({ error: "Stripe not configured" });
+async function requireTechnician(req, res, next) {
+  try {
+    const session = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+
+    if (!session?.user) {
+      return res.status(401).json({
+        error: "Unauthorized. Please log in.",
+      });
     }
 
-    // Verify signature
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("Webhook signature verification failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+    if (session.user.role !== "technician") {
+      return res.status(403).json({
+        error: "Access denied. Technician account required.",
+      });
     }
 
-    // Handle the checkout.session.completed event
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const { bookingId, customerId } = session.metadata;
-      const stripeSessionId = session.id;
-      const amount = session.amount_total / 100; // convert from paisa to taka
+    req.userId = session.user.id;
 
-      try {
-        // Idempotency check: skip if payment already recorded
-        const existing = await paymentsCol.findOne({ stripeSessionId });
-        if (!existing) {
-          // Generate a simple random transaction ID
-          const transactionId =
-            "TXN-" + Math.random().toString(36).substring(2, 10).toUpperCase();
+    return next();
+  } catch (error) {
+    console.error("Technician authentication error:", error);
 
-          // Insert payment record
-          await paymentsCol.insertOne({
-            bookingId,
-            customerId,
-            stripeSessionId,
-            amount,
-            status: "paid",
-            paidAt: new Date(),
-            transactionId,
-          });
-
-          // Mark the booking as paid
-          await bookingsCol.updateOne(
-            { _id: new ObjectId(bookingId) },
-            { $set: { paymentStatus: "paid" } }
-          );
-
-          console.log(`Payment recorded for booking ${bookingId}`);
-        } else {
-          console.log(`Payment already recorded for session ${stripeSessionId}`);
-        }
-      } catch (err) {
-        console.error("Error processing webhook event:", err);
-      }
-    }
-
-    res.json({ received: true });
+    return res.status(500).json({
+      error: "Unable to verify authentication.",
+    });
   }
-);
+}
 
-// ─── General Middleware ──────────────────────────────────────────────────────
-app.use(express.json());
+// ─── CORS Middleware ────────────────────────────────────────────────────────
 
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    origin: CLIENT_URL,
     credentials: true,
   })
 );
 
-// ─── Home Route ──────────────────────────────────────────────────────────────
+// ─── Stripe Webhook ─────────────────────────────────────────────────────────
+// IMPORTANT: This route must be before express.json().
+
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe) {
+      return res.status(500).json({
+        error: "Stripe is not configured.",
+      });
+    }
+
+    if (!process.env.STRIPE_WEBHOOK_SECRET) {
+      return res.status(500).json({
+        error: "STRIPE_WEBHOOK_SECRET is missing.",
+      });
+    }
+
+    const signature = req.headers["stripe-signature"];
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      console.error("Webhook signature verification failed:", error.message);
+
+      return res.status(400).send("Invalid Stripe webhook signature.");
+    }
+
+    if (event.type !== "checkout.session.completed") {
+      return res.json({ received: true });
+    }
+
+    const checkoutSession = event.data.object;
+
+    if (checkoutSession.payment_status !== "paid") {
+      return res.json({ received: true });
+    }
+
+    try {
+      const bookingId = checkoutSession.metadata?.bookingId;
+      const customerId = checkoutSession.metadata?.customerId;
+      const stripeSessionId = checkoutSession.id;
+
+      if (!isValidObjectId(bookingId) || !customerId) {
+        return res.status(400).json({
+          error: "Invalid booking or customer metadata.",
+        });
+      }
+
+      const bookingObjectId = new ObjectId(bookingId);
+
+      const booking = await bookingsCol.findOne({
+        _id: bookingObjectId,
+        customerId,
+      });
+
+      if (!booking) {
+        return res.status(400).json({
+          error: "Booking not found or customer mismatch.",
+        });
+      }
+
+      if (booking.status !== "completed") {
+        return res.status(400).json({
+          error: "Booking is not completed.",
+        });
+      }
+
+      const expectedAmount = Math.round(Number(booking.amount) * 100);
+
+      if (
+        !Number.isFinite(expectedAmount) ||
+        expectedAmount <= 0 ||
+        checkoutSession.amount_total !== expectedAmount ||
+        checkoutSession.currency?.toLowerCase() !== "bdt"
+      ) {
+        return res.status(400).json({
+          error: "Payment amount or currency mismatch.",
+        });
+      }
+
+      const transactionId =
+        "TXN-" + randomBytes(4).toString("hex").toUpperCase();
+
+      try {
+        await paymentsCol.updateOne(
+          { stripeSessionId },
+          {
+            $setOnInsert: {
+              bookingId,
+              customerId,
+              stripeSessionId,
+              amount: checkoutSession.amount_total / 100,
+              status: "paid",
+              paidAt: new Date(),
+              transactionId,
+            },
+          },
+          { upsert: true }
+        );
+      } catch (error) {
+        if (error.code !== 11000) {
+          throw error;
+        }
+      }
+
+      await bookingsCol.updateOne(
+        {
+          _id: bookingObjectId,
+          customerId,
+        },
+        {
+          $set: {
+            paymentStatus: "paid",
+          },
+        }
+      );
+
+      console.log(`Payment verified for booking ${bookingId}`);
+
+      return res.json({ received: true });
+    } catch (error) {
+      console.error("Stripe webhook processing failed:", error);
+
+      return res.status(500).json({
+        error: "Webhook processing failed.",
+      });
+    }
+  }
+);
+
+// ─── General Middleware ─────────────────────────────────────────────────────
+
+app.use(express.json());
+
+// ─── Home Route ─────────────────────────────────────────────────────────────
+
 app.get("/", (req, res) => {
   res.send("Mendizo server is running fine!");
 });
 
-// ─── GET /api/customer/stats ─────────────────────────────────────────────────
-// Returns booking counts for the logged-in customer
+// ─── POST Create Technician Service ─────────────────────────────────────────
+
+app.post(
+  "/api/technician/services",
+  requireTechnician,
+  async (req, res) => {
+    try {
+      const {
+        title,
+        category,
+        description,
+        price,
+        pricingType,
+        duration,
+        location,
+        imageUrl,
+        whatsIncluded,
+        requirements,
+        status,
+      } = req.body;
+
+      if (
+        typeof title !== "string" ||
+        !title.trim() ||
+        typeof category !== "string" ||
+        !category.trim() ||
+        typeof description !== "string" ||
+        !description.trim() ||
+        price === undefined ||
+        typeof location !== "string" ||
+        !location.trim()
+      ) {
+        return res.status(400).json({
+          error: "Please provide all required service information.",
+        });
+      }
+
+      const servicePrice = Number(price);
+
+      if (!Number.isFinite(servicePrice) || servicePrice <= 0) {
+        return res.status(400).json({
+          error: "Please provide a valid service price.",
+        });
+      }
+
+      if (!["fixed", "hourly"].includes(pricingType)) {
+        return res.status(400).json({
+          error: "Invalid pricing type. Use fixed or hourly.",
+        });
+      }
+
+      const serviceStatus = status || "published";
+
+      if (!["draft", "published"].includes(serviceStatus)) {
+        return res.status(400).json({
+          error: "Invalid service status.",
+        });
+      }
+
+      const service = {
+        title: title.trim(),
+        category: category.trim(),
+        description: description.trim(),
+        price: servicePrice,
+        pricingType,
+        duration: typeof duration === "string" ? duration.trim() : "",
+        location: location.trim(),
+        imageUrl: typeof imageUrl === "string" ? imageUrl.trim() : "",
+        whatsIncluded: Array.isArray(whatsIncluded)
+          ? whatsIncluded.filter(
+              (item) => typeof item === "string" && item.trim()
+            ).map((item) => item.trim())
+          : [],
+        requirements:
+          typeof requirements === "string" ? requirements.trim() : "",
+
+        // Use the authenticated technician's ID.
+        technicianId: req.userId,
+
+        status: serviceStatus,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await servicesCol.insertOne(service);
+
+      return res.status(201).json({
+        success: true,
+        message: "Service created successfully.",
+        serviceId: result.insertedId,
+      });
+    } catch (error) {
+      console.error("POST /api/technician/services error:", error);
+
+      return res.status(500).json({
+        error: "Unable to create service.",
+      });
+    }
+  }
+);
+
+// ─── GET Customer Stats ─────────────────────────────────────────────────────
+
 app.get("/api/customer/stats", requireCustomer, async (req, res) => {
   try {
-    const allBookings = await bookingsCol
-      .find({ customerId: req.userId })
-      .toArray();
+    const customerQuery = {
+      customerId: req.userId,
+    };
 
-    const total     = allBookings.length;
-    const pending   = allBookings.filter((b) => b.status === "requested").length;
-    const completed = allBookings.filter((b) => b.status === "completed").length;
+    const [total, pending, completed] = await Promise.all([
+      bookingsCol.countDocuments(customerQuery),
 
-    res.json({ total, pending, completed });
-  } catch (err) {
-    console.error("GET /api/customer/stats error:", err);
-    res.status(500).json({ error: "Server error" });
+      bookingsCol.countDocuments({
+        ...customerQuery,
+        status: "requested",
+      }),
+
+      bookingsCol.countDocuments({
+        ...customerQuery,
+        status: "completed",
+      }),
+    ]);
+
+    res.json({
+      total,
+      pending,
+      completed,
+    });
+  } catch (error) {
+    console.error("GET /api/customer/stats error:", error);
+
+    res.status(500).json({
+      error: "Server error",
+    });
   }
 });
 
-// ─── GET /api/customer/bookings ───────────────────────────────────────────────
-// Returns all bookings for the logged-in customer with service & technician info
+// ─── GET Customer Bookings ──────────────────────────────────────────────────
+
 app.get("/api/customer/bookings", requireCustomer, async (req, res) => {
   try {
-    // Get all bookings for this customer, newest first
     const bookings = await bookingsCol
       .find({ customerId: req.userId })
       .sort({ createdAt: -1 })
       .toArray();
 
-    // Enrich each booking with service title and technician name
     const enriched = await Promise.all(
       bookings.map(async (booking) => {
-        // Fetch service name
         let serviceTitle = "N/A";
+        let technicianName = "N/A";
+
         if (booking.serviceId) {
-          // serviceId might be a string or ObjectId — try ObjectId first
-          let service = null;
-          try {
-            service = await servicesCol.findOne({
-              _id: new ObjectId(booking.serviceId),
-            });
-          } catch {
-            service = await servicesCol.findOne({ _id: booking.serviceId });
+          const service = await findByIdOrString(
+            servicesCol,
+            booking.serviceId
+          );
+
+          if (service) {
+            serviceTitle = service.title || service.name || "N/A";
           }
-          if (service) serviceTitle = service.title || service.name || "N/A";
         }
 
-        // Fetch technician name from user collection by string id field
-        let technicianName = "N/A";
         if (booking.technicianId) {
-          const technician = await usersCol.findOne({ id: booking.technicianId });
-          if (technician) technicianName = technician.name || "N/A";
+          const technician = await usersCol.findOne({
+            id: booking.technicianId,
+          });
+
+          if (technician) {
+            technicianName = technician.name || "N/A";
+          }
         }
 
         return {
-          _id:           booking._id,
+          _id: booking._id,
           serviceTitle,
           technicianName,
           preferredDate: booking.preferredDate,
-          amount:        booking.amount,
-          status:        booking.status,
+          amount: booking.amount,
+          status: booking.status,
           paymentStatus: booking.paymentStatus || "unpaid",
-          createdAt:     booking.createdAt,
+          createdAt: booking.createdAt,
         };
       })
     );
 
     res.json(enriched);
-  } catch (err) {
-    console.error("GET /api/customer/bookings error:", err);
-    res.status(500).json({ error: "Server error" });
+  } catch (error) {
+    console.error("GET /api/customer/bookings error:", error);
+
+    res.status(500).json({
+      error: "Server error",
+    });
   }
 });
 
-// ─── POST /api/customer/bookings/:id/cancel ───────────────────────────────────
-// Cancels a booking that is still in "requested" status
+// ─── POST Cancel Booking ────────────────────────────────────────────────────
+
 app.post(
   "/api/customer/bookings/:id/cancel",
   requireCustomer,
@@ -262,192 +516,259 @@ app.post(
     try {
       const bookingId = req.params.id;
 
-      // Find booking by MongoDB _id
-      let booking;
-      try {
-        booking = await bookingsCol.findOne({ _id: new ObjectId(bookingId) });
-      } catch {
-        return res.status(404).json({ error: "Booking not found" });
+      if (!isValidObjectId(bookingId)) {
+        return res.status(404).json({
+          error: "Booking not found.",
+        });
       }
 
-      if (!booking) return res.status(404).json({ error: "Booking not found" });
+      const bookingObjectId = new ObjectId(bookingId);
 
-      // Ownership check
+      const booking = await bookingsCol.findOne({
+        _id: bookingObjectId,
+      });
+
+      if (!booking) {
+        return res.status(404).json({
+          error: "Booking not found.",
+        });
+      }
+
       if (booking.customerId !== req.userId) {
-        return res.status(403).json({ error: "Forbidden" });
+        return res.status(403).json({
+          error: "Forbidden.",
+        });
       }
 
-      // Status check: only "requested" bookings can be cancelled
       if (booking.status !== "requested") {
-        return res
-          .status(400)
-          .json({ error: "Only requested bookings can be cancelled" });
+        return res.status(400).json({
+          error: "Only requested bookings can be cancelled.",
+        });
       }
 
-      // Update status to cancelled
-      await bookingsCol.updateOne(
-        { _id: new ObjectId(bookingId) },
-        { $set: { status: "cancelled" } }
+      const result = await bookingsCol.updateOne(
+        {
+          _id: bookingObjectId,
+          customerId: req.userId,
+          status: "requested",
+        },
+        {
+          $set: {
+            status: "cancelled",
+            updatedAt: new Date(),
+          },
+        }
       );
 
-      res.json({ success: true });
-    } catch (err) {
-      console.error("POST /api/customer/bookings/:id/cancel error:", err);
-      res.status(500).json({ error: "Server error" });
+      if (result.matchedCount === 0) {
+        return res.status(409).json({
+          error: "Booking can no longer be cancelled.",
+        });
+      }
+
+      res.json({
+        success: true,
+      });
+    } catch (error) {
+      console.error("POST cancel booking error:", error);
+
+      res.status(500).json({
+        error: "Server error",
+      });
     }
   }
 );
 
-// ─── POST /api/customer/checkout ─────────────────────────────────────────────
-// Creates a Stripe Checkout Session for a completed, unpaid booking
+// ─── POST Create Stripe Checkout ────────────────────────────────────────────
+
 app.post("/api/customer/checkout", requireCustomer, async (req, res) => {
   try {
-    // Check Stripe is configured
     if (!stripe) {
       return res.status(500).json({
-        error:
-          "Stripe is not configured. Add STRIPE_SECRET_KEY to your .env file.",
+        error: "Stripe is not configured. Add STRIPE_SECRET_KEY to .env.",
       });
     }
 
     const { bookingId } = req.body;
-    if (!bookingId) {
-      return res.status(400).json({ error: "bookingId is required" });
+
+    if (!isValidObjectId(bookingId)) {
+      return res.status(400).json({
+        error: "A valid bookingId is required.",
+      });
     }
 
-    // Find the booking
-    let booking;
-    try {
-      booking = await bookingsCol.findOne({ _id: new ObjectId(bookingId) });
-    } catch {
-      return res.status(404).json({ error: "Booking not found" });
-    }
+    const bookingObjectId = new ObjectId(bookingId);
 
-    if (!booking) return res.status(404).json({ error: "Booking not found" });
-
-    // Ownership check
-    if (booking.customerId !== req.userId) {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    // Must be completed and unpaid
-    if (booking.status !== "completed") {
-      return res
-        .status(400)
-        .json({ error: "Booking must be completed before payment" });
-    }
-
-    if (booking.paymentStatus === "paid") {
-      return res.status(400).json({ error: "Already paid" });
-    }
-
-    // Create Stripe Checkout Session
-    // Amount from DB (in taka) → Stripe expects smallest unit (paisa), so × 100
-    const stripeSession = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "bdt",
-            product_data: {
-              name: "Mendizo Service Booking",
-            },
-            unit_amount: Math.round(booking.amount * 100), // paisa
-          },
-          quantity: 1,
-        },
-      ],
-      mode: "payment",
-      success_url:
-        "http://localhost:3000/dashboard/customer/bookings?payment=success",
-      cancel_url:
-        "http://localhost:3000/dashboard/customer/bookings?payment=cancelled",
-      metadata: {
-        bookingId: booking._id.toString(),
-        customerId: req.userId,
-      },
+    const booking = await bookingsCol.findOne({
+      _id: bookingObjectId,
     });
 
-    res.json({ url: stripeSession.url });
-  } catch (err) {
-    console.error("POST /api/customer/checkout error:", err);
-    res.status(500).json({ error: "Server error" });
+    if (!booking) {
+      return res.status(404).json({
+        error: "Booking not found.",
+      });
+    }
+
+    if (booking.customerId !== req.userId) {
+      return res.status(403).json({
+        error: "Forbidden.",
+      });
+    }
+
+    if (booking.status !== "completed") {
+      return res.status(400).json({
+        error: "Booking must be completed before payment.",
+      });
+    }
+
+    if ((booking.paymentStatus ?? "unpaid") !== "unpaid") {
+      return res.status(400).json({
+        error: "This booking is not eligible for payment.",
+      });
+    }
+
+    const amount = Number(booking.amount);
+    const amountInPaisa = Math.round(amount * 100);
+
+    if (
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      !Number.isSafeInteger(amountInPaisa) ||
+      amountInPaisa <= 0
+    ) {
+      return res.status(400).json({
+        error: "Invalid booking amount.",
+      });
+    }
+
+    const stripeSession = await stripe.checkout.sessions.create(
+      {
+        payment_method_types: ["card"],
+
+        line_items: [
+          {
+            price_data: {
+              currency: "bdt",
+              product_data: {
+                name: "Mendizo Service Booking",
+              },
+              unit_amount: amountInPaisa,
+            },
+            quantity: 1,
+          },
+        ],
+
+        mode: "payment",
+
+        success_url: `${CLIENT_URL}/dashboard/customer/bookings?payment=success`,
+
+        cancel_url: `${CLIENT_URL}/dashboard/customer/bookings?payment=cancelled`,
+
+        metadata: {
+          bookingId: bookingObjectId.toString(),
+          customerId: req.userId,
+        },
+      },
+      {
+        idempotencyKey: `mendizo-booking-${bookingObjectId.toString()}`,
+      }
+    );
+
+    res.json({
+      url: stripeSession.url,
+    });
+  } catch (error) {
+    console.error("POST /api/customer/checkout error:", error);
+
+    res.status(500).json({
+      error: "Unable to create checkout session.",
+    });
   }
 });
 
-// ─── GET /api/customer/payments ───────────────────────────────────────────────
-// Returns all payments for the logged-in customer with totals
+// ─── GET Customer Payments ──────────────────────────────────────────────────
+
 app.get("/api/customer/payments", requireCustomer, async (req, res) => {
   try {
     const payments = await paymentsCol
-      .find({ customerId: req.userId })
-      .sort({ paidAt: -1 })
+      .find({
+        customerId: req.userId,
+      })
+      .sort({
+        paidAt: -1,
+      })
       .toArray();
 
-    // Enrich with service title and technician name via booking
     const enriched = await Promise.all(
       payments.map(async (payment) => {
-        let serviceTitle   = "N/A";
+        let serviceTitle = "N/A";
         let technicianName = "N/A";
 
         if (payment.bookingId) {
-          // bookingId stored in payments is a string from ObjectId.toString()
-          let booking = null;
-          try {
-            booking = await bookingsCol.findOne({
-              _id: new ObjectId(payment.bookingId),
-            });
-          } catch {
-            // ignore invalid id
-          }
+          const booking = await findByIdOrString(
+            bookingsCol,
+            payment.bookingId
+          );
 
           if (booking) {
-            // Fetch service
             if (booking.serviceId) {
-              let service = null;
-              try {
-                service = await servicesCol.findOne({
-                  _id: new ObjectId(booking.serviceId),
-                });
-              } catch {
-                service = await servicesCol.findOne({ _id: booking.serviceId });
+              const service = await findByIdOrString(
+                servicesCol,
+                booking.serviceId
+              );
+
+              if (service) {
+                serviceTitle = service.title || service.name || "N/A";
               }
-              if (service) serviceTitle = service.title || service.name || "N/A";
             }
 
-            // Fetch technician
             if (booking.technicianId) {
               const technician = await usersCol.findOne({
                 id: booking.technicianId,
               });
-              if (technician) technicianName = technician.name || "N/A";
+
+              if (technician) {
+                technicianName = technician.name || "N/A";
+              }
             }
           }
         }
 
         return {
-          _id:           payment._id,
+          _id: payment._id,
           serviceTitle,
           technicianName,
-          amount:        payment.amount,
+          amount: payment.amount,
           transactionId: payment.transactionId,
-          paidAt:        payment.paidAt,
-          status:        payment.status,
+          paidAt: payment.paidAt,
+          status: payment.status,
         };
       })
     );
 
-    // Sum of all paid amounts
-    const totalPaid = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const totalPaid = payments.reduce((sum, payment) => {
+      if (payment.status !== "paid") return sum;
 
-    res.json({ payments: enriched, totalPaid });
-  } catch (err) {
-    console.error("GET /api/customer/payments error:", err);
-    res.status(500).json({ error: "Server error" });
+      const amount = Number(payment.amount);
+
+      return sum + (Number.isFinite(amount) ? amount : 0);
+    }, 0);
+
+    res.json({
+      payments: enriched,
+      totalPaid,
+    });
+  } catch (error) {
+    console.error("GET /api/customer/payments error:", error);
+
+    res.status(500).json({
+      error: "Server error",
+    });
   }
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// ─── Start Server ───────────────────────────────────────────────────────────
+
 async function startServer() {
   try {
     await connectToMongoDB();
@@ -457,6 +778,7 @@ async function startServer() {
     });
   } catch (error) {
     console.error("Server startup failed:", error);
+
     process.exit(1);
   }
 }
