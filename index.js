@@ -496,6 +496,237 @@ app.get("/api/services/:id", async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// CUSTOMER BOOKINGS & PAYMENTS (CHALLENGE 2 & CHALLENGE 3)
+// ───────────────────────────────────────────────────────────────────────────
+
+// POST /api/bookings - Customer submits repair request
+app.post("/api/bookings", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const {
+      serviceId,
+      customerPhone,
+      phone,
+      address,
+      preferredDate,
+      problemDescription,
+      description,
+    } = req.body;
+
+    const contactPhone = String(customerPhone || phone || "").trim();
+    const serviceAddress = String(address || "").trim();
+    const problem = String(problemDescription || description || "").trim();
+
+    if (!serviceId) {
+      return res.status(400).json({ error: "Service ID is required." });
+    }
+
+    if (!contactPhone) {
+      return res.status(400).json({ error: "Contact phone number is required." });
+    }
+
+    if (!serviceAddress) {
+      return res.status(400).json({ error: "Service/pickup address is required." });
+    }
+
+    if (!preferredDate) {
+      return res.status(400).json({ error: "Preferred service date is required." });
+    }
+
+    const prefDate = new Date(preferredDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (isNaN(prefDate.getTime()) || prefDate < today) {
+      return res.status(400).json({
+        error: "Preferred date must be today or a future date.",
+      });
+    }
+
+    if (problem.length < 20) {
+      return res.status(400).json({
+        error: "Problem description must be at least 20 characters.",
+      });
+    }
+
+    // Verify service exists
+    const service = await findByIdOrString(servicesCol, serviceId);
+    if (!service) {
+      return res.status(404).json({ error: "Service not found." });
+    }
+
+    if (service.approvalStatus !== "approved" || service.isAvailable === false) {
+      return res.status(400).json({
+        error: "This service is currently not available for booking.",
+      });
+    }
+
+    // Technician cannot request their own service
+    if (service.technicianEmail === req.user.email) {
+      return res.status(400).json({
+        error: "You cannot request your own service.",
+      });
+    }
+
+    // Business Rule: Prevent duplicate active requests for the same service
+    const existingActiveBooking = await bookingsCol.findOne({
+      serviceId: service._id.toString(),
+      customerEmail: req.user.email,
+      status: { $in: ["requested", "accepted", "in-progress"] },
+    });
+
+    if (existingActiveBooking) {
+      return res.status(400).json({
+        error: "You already have an active request for this service.",
+      });
+    }
+
+    // Create booking document copying required fields from service
+    const basePrice = Number(service.basePrice || service.price || 0);
+
+    const bookingDoc = {
+      serviceId: service._id.toString(),
+      serviceTitle: service.title,
+      serviceImage: service.image || service.imageUrl || "",
+      category: service.category,
+      basePrice,
+      technicianName: service.technicianName,
+      technicianEmail: service.technicianEmail,
+      technicianId: service.technicianId || "",
+
+      customerId: req.userId,
+      customerName: req.user.name || "Customer",
+      customerEmail: req.user.email,
+      customerPhone: contactPhone,
+      address: serviceAddress,
+      preferredDate: prefDate,
+      problemDescription: problem,
+
+      status: "requested",
+      finalAmount: basePrice,
+      amount: basePrice,
+      paymentStatus: "unpaid",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await bookingsCol.insertOne(bookingDoc);
+
+    res.status(201).json({
+      success: true,
+      message: "Repair request submitted successfully!",
+      bookingId: result.insertedId,
+      booking: { ...bookingDoc, _id: result.insertedId },
+    });
+  } catch (error) {
+    console.error("POST /api/bookings error:", error);
+    res.status(500).json({ error: "Unable to submit booking request." });
+  }
+});
+
+// PATCH /api/bookings/:id/cancel - Customer cancels a requested booking
+app.patch(
+  ["/api/bookings/:id/cancel", "/api/customer/bookings/:id/cancel"],
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const bookingId = req.params.id;
+      const booking = await findByIdOrString(bookingsCol, bookingId);
+
+      if (!booking) {
+        return res.status(404).json({ error: "Booking not found." });
+      }
+
+      // Check ownership
+      const isOwner =
+        booking.customerEmail === req.user.email ||
+        booking.customerId === req.userId;
+
+      if (!isOwner) {
+        return res.status(403).json({ error: "Forbidden. You do not own this booking." });
+      }
+
+      // Customer can cancel only while status === 'requested'
+      if (booking.status !== "requested") {
+        return res.status(400).json({
+          error: "Only requested bookings can be cancelled.",
+        });
+      }
+
+      await bookingsCol.updateOne(
+        { _id: booking._id },
+        {
+          $set: {
+            status: "cancelled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.json({
+        success: true,
+        message: "Booking cancelled successfully.",
+      });
+    } catch (error) {
+      console.error("PATCH cancel booking error:", error);
+      res.status(500).json({ error: "Unable to cancel booking." });
+    }
+  }
+);
+
+// GET /api/bookings/my & /api/customer/bookings - Customer views their bookings
+app.get(
+  ["/api/bookings/my", "/api/customer/bookings"],
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const bookings = await bookingsCol
+        .find({
+          $or: [
+            { customerEmail: req.user.email },
+            { customerId: req.userId },
+          ],
+        })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json(bookings);
+    } catch (error) {
+      console.error("GET customer bookings error:", error);
+      res.status(500).json({ error: "Unable to fetch bookings." });
+    }
+  }
+);
+
+// GET /api/customer/stats - Customer dashboard stats
+app.get("/api/customer/stats", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const filter = {
+      $or: [
+        { customerEmail: req.user.email },
+        { customerId: req.userId },
+      ],
+    };
+
+    const [total, pending, completed] = await Promise.all([
+      bookingsCol.countDocuments(filter),
+      bookingsCol.countDocuments({
+        ...filter,
+        status: { $in: ["requested", "accepted", "in-progress"] },
+      }),
+      bookingsCol.countDocuments({
+        ...filter,
+        status: "completed",
+      }),
+    ]);
+
+    res.json({ total, pending, completed });
+  } catch (error) {
+    console.error("GET /api/customer/stats error:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 
 async function startServer() {
   try {
