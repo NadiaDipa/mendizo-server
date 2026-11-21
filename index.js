@@ -932,6 +932,260 @@ app.get("/api/customer/payments", verifyToken, verifyCustomer, async (req, res) 
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// TECHNICIAN SERVICE MANAGEMENT (FULL CRUD & CHALLENGE 2, 3)
+// ───────────────────────────────────────────────────────────────────────────
+
+// POST /api/services & /api/technician/services - Technician adds a service
+app.post(
+  ["/api/services", "/api/technician/services"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const {
+        title,
+        category,
+        description,
+        basePrice,
+        price,
+        estimatedDuration,
+        serviceMode,
+        serviceArea,
+        image,
+        imageUrl,
+      } = req.body;
+
+      const servicePrice = Number(basePrice ?? price);
+      const serviceImg = String(image || imageUrl || "").trim();
+
+      if (
+        !title?.trim() ||
+        !category?.trim() ||
+        !description?.trim() ||
+        !Number.isFinite(servicePrice) ||
+        servicePrice <= 0 ||
+        !serviceMode?.trim() ||
+        !serviceArea?.trim() ||
+        !serviceImg
+      ) {
+        return res.status(400).json({
+          error: "Please provide all required service information.",
+        });
+      }
+
+      const serviceDoc = {
+        title: title.trim(),
+        category: category.trim(),
+        description: description.trim(),
+        basePrice: servicePrice,
+        estimatedDuration: String(estimatedDuration || "").trim(),
+        serviceMode: serviceMode.trim(),
+        serviceArea: serviceArea.trim(),
+        image: serviceImg,
+        imageUrl: serviceImg,
+
+        technicianId: req.userId,
+        technicianName: req.user.name || "Technician",
+        technicianEmail: req.user.email,
+
+        approvalStatus: "pending", // Waiting for admin approval
+        isAvailable: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await servicesCol.insertOne(serviceDoc);
+
+      res.status(201).json({
+        success: true,
+        message: "Service submitted and waiting for admin approval.",
+        serviceId: result.insertedId,
+        service: { ...serviceDoc, _id: result.insertedId },
+      });
+    } catch (error) {
+      console.error("POST create service error:", error);
+      res.status(500).json({ error: "Unable to create service." });
+    }
+  }
+);
+
+// GET /api/services/technician/my & /api/technician/services - Technician's own services
+app.get(
+  ["/api/services/technician/my", "/api/technician/services"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const services = await servicesCol
+        .find({
+          $or: [
+            { technicianEmail: req.user.email },
+            { technicianId: req.userId },
+          ],
+        })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      const formatted = services.map((s) => ({
+        ...s,
+        image: s.image || s.imageUrl || "",
+        imageUrl: s.image || s.imageUrl || "",
+      }));
+
+      res.json(formatted);
+    } catch (error) {
+      console.error("GET technician services error:", error);
+      res.status(500).json({ error: "Unable to fetch services." });
+    }
+  }
+);
+
+// PATCH /api/services/:id & /api/technician/services/:id - Update technician's service
+app.patch(
+  ["/api/services/:id", "/api/technician/services/:id"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const serviceId = req.params.id;
+      const service = await findByIdOrString(servicesCol, serviceId);
+
+      if (!service) {
+        return res.status(404).json({ error: "Service not found." });
+      }
+
+      // Verify ownership
+      const isOwner =
+        service.technicianEmail === req.user.email ||
+        service.technicianId === req.userId;
+
+      if (!isOwner) {
+        return res.status(403).json({ error: "Forbidden. You do not own this service." });
+      }
+
+      const {
+        title,
+        category,
+        description,
+        basePrice,
+        estimatedDuration,
+        serviceMode,
+        serviceArea,
+        image,
+        imageUrl,
+      } = req.body;
+
+      const updateData = {
+        updatedAt: new Date(),
+        approvalStatus: "pending", // Requirement: Editing sets approvalStatus back to 'pending'!
+      };
+
+      if (title?.trim()) updateData.title = title.trim();
+      if (category?.trim()) updateData.category = category.trim();
+      if (description?.trim()) updateData.description = description.trim();
+      if (basePrice !== undefined) {
+        const p = Number(basePrice);
+        if (Number.isFinite(p) && p > 0) updateData.basePrice = p;
+      }
+      if (estimatedDuration !== undefined) updateData.estimatedDuration = String(estimatedDuration).trim();
+      if (serviceMode?.trim()) updateData.serviceMode = serviceMode.trim();
+      if (serviceArea?.trim()) updateData.serviceArea = serviceArea.trim();
+      const img = image || imageUrl;
+      if (img?.trim()) {
+        updateData.image = img.trim();
+        updateData.imageUrl = img.trim();
+      }
+
+      await servicesCol.updateOne({ _id: service._id }, { $set: updateData });
+
+      res.json({
+        success: true,
+        message: "Service updated. It is waiting for admin approval.",
+      });
+    } catch (error) {
+      console.error("PATCH service error:", error);
+      res.status(500).json({ error: "Unable to update service." });
+    }
+  }
+);
+
+// DELETE /api/services/:id & /api/technician/services/:id - Delete technician's service
+app.delete(
+  ["/api/services/:id", "/api/technician/services/:id"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const serviceId = req.params.id;
+      const service = await findByIdOrString(servicesCol, serviceId);
+
+      if (!service) {
+        return res.status(404).json({ error: "Service not found." });
+      }
+
+      const isOwner =
+        service.technicianEmail === req.user.email ||
+        service.technicianId === req.userId;
+
+      if (!isOwner) {
+        return res.status(403).json({ error: "Forbidden. You do not own this service." });
+      }
+
+      await servicesCol.deleteOne({ _id: service._id });
+
+      res.json({
+        success: true,
+        message: "Service deleted successfully.",
+      });
+    } catch (error) {
+      console.error("DELETE service error:", error);
+      res.status(500).json({ error: "Unable to delete service." });
+    }
+  }
+);
+
+// PATCH /api/services/:id/availability & /api/technician/services/:id/availability - Toggle service availability
+app.patch(
+  ["/api/services/:id/availability", "/api/technician/services/:id/availability"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const serviceId = req.params.id;
+      const { isAvailable } = req.body;
+
+      const service = await findByIdOrString(servicesCol, serviceId);
+      if (!service) {
+        return res.status(404).json({ error: "Service not found." });
+      }
+
+      const isOwner =
+        service.technicianEmail === req.user.email ||
+        service.technicianId === req.userId;
+
+      if (!isOwner) {
+        return res.status(403).json({ error: "Forbidden. You do not own this service." });
+      }
+
+      const newStatus = typeof isAvailable === "boolean" ? isAvailable : !service.isAvailable;
+
+      await servicesCol.updateOne(
+        { _id: service._id },
+        { $set: { isAvailable: newStatus, updatedAt: new Date() } }
+      );
+
+      res.json({
+        success: true,
+        isAvailable: newStatus,
+        message: newStatus ? "Service is now available." : "Service is now unavailable.",
+      });
+    } catch (error) {
+      console.error("PATCH availability error:", error);
+      res.status(500).json({ error: "Unable to update availability." });
+    }
+  }
+);
+
 
 async function startServer() {
   try {
