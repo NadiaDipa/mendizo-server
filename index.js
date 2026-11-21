@@ -1186,6 +1186,104 @@ app.patch(
   }
 );
 
+// GET /api/bookings/technician & /api/technician/requests - Technician requests
+app.get(
+  ["/api/bookings/technician", "/api/technician/requests"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const bookings = await bookingsCol
+        .find({
+          $or: [
+            { technicianEmail: req.user.email },
+            { technicianId: req.userId },
+          ],
+        })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json(bookings);
+    } catch (error) {
+      console.error("GET technician requests error:", error);
+      res.status(500).json({ error: "Unable to fetch technician requests." });
+    }
+  }
+);
+
+// PATCH /api/bookings/:id/status & /api/technician/requests/:id/status - Update job status pipeline (Challenge 3)
+app.patch(
+  ["/api/bookings/:id/status", "/api/technician/requests/:id/status"],
+  verifyToken,
+  verifyTechnician,
+  async (req, res) => {
+    try {
+      const bookingId = req.params.id;
+      const { status, finalAmount } = req.body;
+
+      const booking = await findByIdOrString(bookingsCol, bookingId);
+      if (!booking) {
+        return res.status(404).json({ error: "Booking not found." });
+      }
+
+      // Verify technician ownership
+      const isOwner =
+        booking.technicianEmail === req.user.email ||
+        booking.technicianId === req.userId;
+
+      if (!isOwner) {
+        return res.status(403).json({ error: "Forbidden. You do not own this job." });
+      }
+
+      // Strictly Enforced Status Pipeline (Challenge 3)
+      // requested -> accepted or rejected
+      // accepted -> in-progress
+      // in-progress -> completed (requires finalAmount)
+      const validTransitions = {
+        requested: ["accepted", "rejected"],
+        accepted: ["in-progress"],
+        "in-progress": ["completed"],
+      };
+
+      if (!validTransitions[booking.status]?.includes(status)) {
+        return res.status(400).json({
+          error: `Cannot transition status from '${booking.status}' to '${status}'.`,
+        });
+      }
+
+      const updateFields = {
+        status,
+        updatedAt: new Date(),
+      };
+
+      if (status === "completed") {
+        const amount = Number(finalAmount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          return res.status(400).json({
+            error: "Must send finalAmount (positive number) when completing a job.",
+          });
+        }
+        updateFields.finalAmount = amount;
+        updateFields.amount = amount;
+        updateFields.completedAt = new Date();
+      }
+
+      await bookingsCol.updateOne({ _id: booking._id }, { $set: updateFields });
+
+      res.json({
+        success: true,
+        message: `Booking status updated to ${status}.`,
+        status,
+        finalAmount: updateFields.finalAmount,
+      });
+    } catch (error) {
+      console.error("PATCH booking status error:", error);
+      res.status(500).json({ error: "Unable to update booking status." });
+    }
+  }
+);
+
+// ───────────────────────────────────────────────────────────────────────────
 
 async function startServer() {
   try {
