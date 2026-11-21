@@ -1284,6 +1284,211 @@ app.patch(
 );
 
 // ───────────────────────────────────────────────────────────────────────────
+// ADMIN MANAGEMENT (CHALLENGE 2)
+// ───────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/stats - Admin Dashboard Overview Stats
+app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [totalUsers, totalTechnicians, pendingServices, totalBookings, payments] =
+      await Promise.all([
+        usersCol.countDocuments(),
+        usersCol.countDocuments({ role: "technician" }),
+        servicesCol.countDocuments({ approvalStatus: "pending" }),
+        bookingsCol.countDocuments(),
+        paymentsCol.find({ paymentStatus: "paid" }).toArray(),
+      ]);
+
+    const totalRevenue = payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+    res.json({
+      totalUsers,
+      totalTechnicians,
+      pendingServices,
+      totalBookings,
+      totalRevenue,
+    });
+  } catch (error) {
+    console.error("GET /api/admin/stats error:", error);
+    res.status(500).json({ error: "Unable to fetch admin stats." });
+  }
+});
+
+// GET /api/admin/users - List all users
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const users = await usersCol
+      .find({})
+      .project({
+        _id: 1,
+        id: 1,
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+        phone: 1,
+        area: 1,
+        createdAt: 1,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(users);
+  } catch (error) {
+    console.error("GET /api/admin/users error:", error);
+    res.status(500).json({ error: "Unable to fetch users." });
+  }
+});
+
+// PATCH /api/admin/users/:id/role - Admin changes user role
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { role } = req.body;
+
+    if (!["customer", "technician", "admin"].includes(role)) {
+      return res.status(400).json({
+        error: "Invalid role. Must be 'customer', 'technician', or 'admin'.",
+      });
+    }
+
+    const targetUser = await findByIdOrString(usersCol, userId);
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    // Rule: Admin cannot change their own role!
+    if (targetUser.email === req.user.email) {
+      return res.status(400).json({
+        error: "Admins cannot change their own role.",
+      });
+    }
+
+    await usersCol.updateOne(
+      { _id: targetUser._id },
+      { $set: { role, updatedAt: new Date() } }
+    );
+
+    res.json({
+      success: true,
+      message: `User role updated to ${role}.`,
+    });
+  } catch (error) {
+    console.error("PATCH /api/admin/users/:id/role error:", error);
+    res.status(500).json({ error: "Unable to update user role." });
+  }
+});
+
+// GET /api/admin/services - List all services from all technicians with approval filter
+app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { approvalStatus } = req.query;
+    const query = {};
+
+    if (approvalStatus && approvalStatus !== "all") {
+      query.approvalStatus = approvalStatus;
+    }
+
+    const services = await servicesCol
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const formatted = services.map((s) => ({
+      ...s,
+      image: s.image || s.imageUrl || "",
+      imageUrl: s.image || s.imageUrl || "",
+    }));
+
+    res.json(formatted);
+  } catch (error) {
+    console.error("GET /api/admin/services error:", error);
+    res.status(500).json({ error: "Unable to fetch services." });
+  }
+});
+
+// PATCH /api/admin/services/:id/approval - Approve or Reject service
+app.patch("/api/admin/services/:id/approval", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const serviceId = req.params.id;
+    const { approvalStatus } = req.body;
+
+    if (!["approved", "rejected", "pending"].includes(approvalStatus)) {
+      return res.status(400).json({
+        error: "approvalStatus must be 'approved', 'rejected', or 'pending'.",
+      });
+    }
+
+    const service = await findByIdOrString(servicesCol, serviceId);
+    if (!service) {
+      return res.status(404).json({ error: "Service not found." });
+    }
+
+    await servicesCol.updateOne(
+      { _id: service._id },
+      { $set: { approvalStatus, updatedAt: new Date() } }
+    );
+
+    res.json({
+      success: true,
+      message: `Service status set to ${approvalStatus}.`,
+      approvalStatus,
+    });
+  } catch (error) {
+    console.error("PATCH service approval error:", error);
+    res.status(500).json({ error: "Unable to update approval status." });
+  }
+});
+
+// GET /api/admin/bookings - Read-only table of all bookings
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { status } = req.query;
+    const query = {};
+    if (status && status !== "all") {
+      query.status = status;
+    }
+
+    const bookings = await bookingsCol
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(bookings);
+  } catch (error) {
+    console.error("GET /api/admin/bookings error:", error);
+    res.status(500).json({ error: "Unable to fetch bookings." });
+  }
+});
+
+// GET /api/admin/payments & /api/admin/transactions - All transactions & total revenue
+app.get(
+  ["/api/admin/payments", "/api/admin/transactions"],
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const payments = await paymentsCol
+        .find({})
+        .sort({ paidAt: -1 })
+        .toArray();
+
+      const totalRevenue = payments
+        .filter((p) => p.paymentStatus === "paid")
+        .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+      res.json({
+        payments,
+        totalRevenue,
+      });
+    } catch (error) {
+      console.error("GET /api/admin/payments error:", error);
+      res.status(500).json({ error: "Unable to fetch transactions." });
+    }
+  }
+);
+
+// ───────────────────────────────────────────────────────────────────────────
 
 async function startServer() {
   try {
