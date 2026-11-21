@@ -36,6 +36,7 @@ let usersCol;
 let servicesCol;
 let bookingsCol;
 let paymentsCol;
+let contactMessagesCol;
 
 async function connectToMongoDB() {
   await client.connect();
@@ -47,6 +48,7 @@ async function connectToMongoDB() {
   servicesCol = database.collection("services");
   bookingsCol = database.collection("bookings");
   paymentsCol = database.collection("payments");
+  contactMessagesCol = database.collection("contactMessages");
 
   // Create unique index on payments to prevent duplicate payments
   await paymentsCol.createIndex(
@@ -317,31 +319,43 @@ app.get("/", (req, res) => {
   res.send("Mendizo API server is running fine!");
 });
 
-// POST /api/contact - Public contact form endpoint
+// POST /api/contact - Public contact form endpoint (saves to contactMessages collection)
 app.post("/api/contact", async (req, res) => {
   try {
     const { name, email, subject, message } = req.body;
-    if (!name || !name.trim()) {
+    if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Your name is required." });
     }
-    if (!email || !email.trim()) {
+    if (!email || typeof email !== "string" || !email.trim()) {
       return res.status(400).json({ error: "Your email address is required." });
     }
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email.trim())) {
       return res.status(400).json({ error: "A valid email address is required." });
     }
-    if (!subject || !subject.trim()) {
+    if (!subject || typeof subject !== "string" || !subject.trim()) {
       return res.status(400).json({ error: "A subject is required." });
     }
-    if (!message || message.trim().length < 10) {
+    if (!message || typeof message !== "string" || message.trim().length < 10) {
       return res.status(400).json({ error: "Message must be at least 10 characters long." });
     }
 
-    console.log(`[Contact Form Received] From: ${name.trim()} <${email.trim()}> | Subject: ${subject.trim()}`);
-    return res.json({
+    const contactDoc = {
+      name: name.trim(),
+      email: email.trim().toLowerCase(),
+      subject: subject.trim(),
+      message: message.trim(),
+      createdAt: new Date(),
+    };
+
+    const result = await contactMessagesCol.insertOne(contactDoc);
+
+    console.log(`[Contact Form Saved] ID: ${result.insertedId} | From: ${contactDoc.name} <${contactDoc.email}> | Subject: ${contactDoc.subject}`);
+
+    return res.status(201).json({
       success: true,
-      message: "Thank you for reaching out! Our support team will respond within 24 hours.",
+      message: "Thank you for reaching out! Your message has been received.",
+      id: result.insertedId,
     });
   } catch (error) {
     console.error("POST /api/contact error:", error);

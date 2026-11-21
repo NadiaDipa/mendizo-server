@@ -21,7 +21,7 @@ async function seed() {
     // 1. Seed or update Admin
     const adminUser = {
       name: "Mendizo Admin",
-      email: "admin@fixmate.com",
+      email: "admin@mendizo.com",
       role: "admin",
       phone: "+880 1700 000001",
       area: "Gulshan, Dhaka",
@@ -36,12 +36,18 @@ async function seed() {
       { $set: adminUser },
       { upsert: true }
     );
-    console.log("Admin seeded: admin@fixmate.com");
+    // Legacy mirror support
+    await usersCol.updateOne(
+      { email: "admin@fixmate.com" },
+      { $set: { ...adminUser, email: "admin@fixmate.com" } },
+      { upsert: true }
+    );
+    console.log("Admin seeded: admin@mendizo.com");
 
     // 2. Seed Technicians (At least 2 required)
     const technician1 = {
       name: "Rafiqul Islam",
-      email: "rafiqul.tech@fixmate.com",
+      email: "rafiqul.tech@mendizo.com",
       role: "technician",
       phone: "+880 1711 112233",
       area: "Dhanmondi, Dhaka",
@@ -53,7 +59,7 @@ async function seed() {
 
     const technician2 = {
       name: "Tanvir Ahmed",
-      email: "tanvir.tech@fixmate.com",
+      email: "tanvir.tech@mendizo.com",
       role: "technician",
       phone: "+880 1722 334455",
       area: "Mirpur, Dhaka",
@@ -65,7 +71,7 @@ async function seed() {
 
     const technician3 = {
       name: "Sumon Hossain",
-      email: "sumon.tech@fixmate.com",
+      email: "sumon.tech@mendizo.com",
       role: "technician",
       phone: "+880 1733 445566",
       area: "Uttara, Dhaka",
@@ -78,12 +84,16 @@ async function seed() {
     await usersCol.updateOne({ email: technician1.email }, { $set: technician1 }, { upsert: true });
     await usersCol.updateOne({ email: technician2.email }, { $set: technician2 }, { upsert: true });
     await usersCol.updateOne({ email: technician3.email }, { $set: technician3 }, { upsert: true });
+    // Legacy mirrors
+    await usersCol.updateOne({ email: "rafiqul.tech@fixmate.com" }, { $set: { ...technician1, email: "rafiqul.tech@fixmate.com" } }, { upsert: true });
+    await usersCol.updateOne({ email: "tanvir.tech@fixmate.com" }, { $set: { ...technician2, email: "tanvir.tech@fixmate.com" } }, { upsert: true });
+    await usersCol.updateOne({ email: "sumon.tech@fixmate.com" }, { $set: { ...technician3, email: "sumon.tech@fixmate.com" } }, { upsert: true });
     console.log("Technicians seeded (Rafiqul, Tanvir, Sumon)");
 
     // 3. Seed Customer
     const customerUser = {
       name: "Nadia Dipa",
-      email: "customer@fixmate.com",
+      email: "customer@mendizo.com",
       role: "customer",
       phone: "+880 1755 998877",
       area: "Banani, Dhaka",
@@ -94,7 +104,8 @@ async function seed() {
     };
 
     await usersCol.updateOne({ email: customerUser.email }, { $set: customerUser }, { upsert: true });
-    console.log("Customer seeded: customer@fixmate.com");
+    await usersCol.updateOne({ email: "customer@fixmate.com" }, { $set: { ...customerUser, email: "customer@fixmate.com" } }, { upsert: true });
+    console.log("Customer seeded: customer@mendizo.com");
 
     // 4. Seed 14+ Approved Services across 7 Categories
     const sampleServices = [

@@ -93,9 +93,9 @@ Server runs on [http://localhost:5000](http://localhost:5000).
 
 ## 🔑 Seed Test Accounts
 
-- **Admin**: `admin@fixmate.com` (Password: `Admin@1234`)
+- **Admin**: `admin@mendizo.com` / `admin@fixmate.com` (Password: `Admin@1234`)
 - **Technicians**:
-  - `rafiqul.tech@fixmate.com` (Password: `Tech@1234`)
-  - `tanvir.tech@fixmate.com` (Password: `Tech@1234`)
-  - `sumon.tech@fixmate.com` (Password: `Tech@1234`)
-- **Customer**: `customer@fixmate.com` (Password: `Cust@1234`)
+  - `rafiqul.tech@mendizo.com` / `rafiqul.tech@fixmate.com` (Password: `Tech@1234`)
+  - `tanvir.tech@mendizo.com` / `tanvir.tech@fixmate.com` (Password: `Tech@1234`)
+  - `sumon.tech@mendizo.com` / `sumon.tech@fixmate.com` (Password: `Tech@1234`)
+- **Customer**: `customer@mendizo.com` / `customer@fixmate.com` (Password: `Cust@1234`)
