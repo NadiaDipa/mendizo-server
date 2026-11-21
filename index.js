@@ -350,6 +350,152 @@ app.post("/api/contact", async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// PUBLIC SERVICE APIS (CHALLENGE 1: Server-Side Search, Filter & Sort)
+// ───────────────────────────────────────────────────────────────────────────
+
+// GET /api/services - Public with Server-Side Search, Filter & Sort
+app.get("/api/services", async (req, res) => {
+  try {
+    const { search, category, serviceMode, sort, limit, page } = req.query;
+
+    const query = {
+      approvalStatus: "approved",
+      isAvailable: true,
+    };
+
+    // Server-side search by title or category
+    if (search && typeof search === "string" && search.trim()) {
+      const searchRegex = new RegExp(search.trim(), "i");
+      query.$or = [
+        { title: { $regex: searchRegex } },
+        { category: { $regex: searchRegex } },
+        { description: { $regex: searchRegex } },
+      ];
+    }
+
+    // Category filter
+    if (category && typeof category === "string" && category.trim() && category !== "all") {
+      const catTrim = category.trim();
+      // Handle slug formats or exact category names
+      const catMap = {
+        "smartphone": "Smartphone",
+        "laptop-service": "Laptop & PC",
+        "laptop-pc": "Laptop & PC",
+        "ac-servicing": "AC",
+        "ac": "AC",
+        "refrigerator": "Refrigerator",
+        "washing-machine": "Washing Machine",
+        "tv-repair": "TV",
+        "tv": "TV",
+        "electrical-wiring": "Electrical",
+        "electrical": "Electrical",
+      };
+      const normalizedCat = catMap[catTrim.toLowerCase()] || catTrim;
+      query.category = { $regex: new RegExp(`^${normalizedCat}$`, "i") };
+    }
+
+    // Service mode filter
+    if (serviceMode && typeof serviceMode === "string" && serviceMode.trim() && serviceMode !== "all") {
+      const modeTrim = serviceMode.trim();
+      if (modeTrim.toLowerCase().includes("home")) {
+        query.serviceMode = { $regex: /home/i };
+      } else if (modeTrim.toLowerCase().includes("shop") || modeTrim.toLowerCase().includes("drop")) {
+        query.serviceMode = { $regex: /shop/i };
+      } else {
+        query.serviceMode = modeTrim;
+      }
+    }
+
+    // Server-side sort
+    let sortOption = { createdAt: -1 }; // Default newest
+    if (sort === "price-asc") {
+      sortOption = { basePrice: 1 };
+    } else if (sort === "price-desc") {
+      sortOption = { basePrice: -1 };
+    } else if (sort === "newest") {
+      sortOption = { createdAt: -1 };
+    }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, parseInt(limit, 10) || 100);
+    const skipNum = (pageNum - 1) * limitNum;
+
+    const total = await servicesCol.countDocuments(query);
+    const services = await servicesCol
+      .find(query)
+      .sort(sortOption)
+      .skip(skipNum)
+      .limit(limitNum)
+      .toArray();
+
+    // Map image/imageUrl consistently
+    const formatted = services.map((s) => ({
+      ...s,
+      image: s.image || s.imageUrl || "",
+      imageUrl: s.image || s.imageUrl || "",
+    }));
+
+    res.json({
+      success: true,
+      services: formatted,
+      total,
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum),
+    });
+  } catch (error) {
+    console.error("GET /api/services error:", error);
+    res.status(500).json({ error: "Unable to fetch services." });
+  }
+});
+
+// GET /api/services/:id - Public Service Details + Technician Profile Summary
+app.get("/api/services/:id", async (req, res) => {
+  try {
+    const serviceId = req.params.id;
+    const service = await findByIdOrString(servicesCol, serviceId);
+
+    if (!service) {
+      return res.status(404).json({ error: "Service not found." });
+    }
+
+    // Lookup technician profile for technician summary (name, photo, area, bio)
+    let technicianSummary = {
+      name: service.technicianName || "Verified Technician",
+      email: service.technicianEmail || "",
+      image: "",
+      area: service.serviceArea || "Dhaka, Bangladesh",
+      bio: "Professional and certified repair specialist with years of hands-on experience.",
+    };
+
+    if (service.technicianEmail) {
+      const techUser = await usersCol.findOne({ email: service.technicianEmail });
+      if (techUser) {
+        technicianSummary = {
+          name: techUser.name || technicianSummary.name,
+          email: techUser.email || technicianSummary.email,
+          image: techUser.image || "",
+          area: techUser.area || technicianSummary.area,
+          bio: techUser.bio || technicianSummary.bio,
+        };
+      }
+    }
+
+    res.json({
+      success: true,
+      service: {
+        ...service,
+        image: service.image || service.imageUrl || "",
+        imageUrl: service.image || service.imageUrl || "",
+      },
+      technician: technicianSummary,
+    });
+  } catch (error) {
+    console.error("GET /api/services/:id error:", error);
+    res.status(500).json({ error: "Unable to fetch service details." });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
 
 async function startServer() {
   try {
