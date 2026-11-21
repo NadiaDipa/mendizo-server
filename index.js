@@ -1489,7 +1489,74 @@ app.get(
 );
 
 // ───────────────────────────────────────────────────────────────────────────
+// USER PROFILE APIS (SHARED)
+// ───────────────────────────────────────────────────────────────────────────
 
+// GET /api/users/profile - Get profile data
+app.get("/api/users/profile", verifyToken, async (req, res) => {
+  try {
+    const user = await usersCol.findOne({ email: req.user.email });
+    if (!user) {
+      return res.status(404).json({ error: "User profile not found." });
+    }
+
+    res.json({
+      name: user.name || "",
+      email: user.email || "",
+      role: user.role || "customer",
+      image: user.image || "",
+      phone: user.phone || "",
+      area: user.area || "",
+      bio: user.bio || "",
+    });
+  } catch (error) {
+    console.error("GET profile error:", error);
+    res.status(500).json({ error: "Unable to fetch profile." });
+  }
+});
+
+// PATCH /api/users/profile - Update profile data
+app.patch("/api/users/profile", verifyToken, async (req, res) => {
+  try {
+    const { name, phone, area, bio, image } = req.body;
+
+    const updateFields = {
+      updatedAt: new Date(),
+    };
+
+    if (typeof name === "string" && name.trim()) updateFields.name = name.trim();
+    if (typeof phone === "string") updateFields.phone = phone.trim();
+    if (typeof area === "string") updateFields.area = area.trim();
+    if (typeof bio === "string") updateFields.bio = bio.trim();
+    if (typeof image === "string") updateFields.image = image.trim();
+
+    await usersCol.updateOne(
+      { email: req.user.email },
+      { $set: updateFields }
+    );
+
+    const updatedUser = await usersCol.findOne({ email: req.user.email });
+
+    res.json({
+      success: true,
+      message: "Profile updated successfully.",
+      user: {
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        image: updatedUser.image,
+        phone: updatedUser.phone,
+        area: updatedUser.area,
+        bio: updatedUser.bio,
+      },
+    });
+  } catch (error) {
+    console.error("PATCH /api/users/profile error:", error);
+    res.status(500).json({ error: "Unable to update profile." });
+  }
+});
+
+// Start Server
 async function startServer() {
   try {
     await connectToMongoDB();
