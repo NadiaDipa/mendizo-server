@@ -727,6 +727,211 @@ app.get("/api/customer/stats", verifyToken, verifyCustomer, async (req, res) => 
   }
 });
 
+// POST /api/payments/create-checkout-session - Create Stripe Checkout Session
+app.post(
+  ["/api/payments/create-checkout-session", "/api/customer/checkout"],
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const { bookingId } = req.body;
+
+      if (!bookingId) {
+        return res.status(400).json({ error: "Booking ID is required." });
+      }
+
+      const booking = await findByIdOrString(bookingsCol, bookingId);
+      if (!booking) {
+        return res.status(404).json({ error: "Booking not found." });
+      }
+
+      // Verify customer owns this booking
+      const isOwner =
+        booking.customerEmail === req.user.email ||
+        booking.customerId === req.userId;
+
+      if (!isOwner) {
+        return res.status(403).json({ error: "Forbidden. You do not own this booking." });
+      }
+
+      // Enforce Payment Gate: Only completed and unpaid bookings can be paid
+      if (booking.status !== "completed") {
+        return res.status(400).json({
+          error: "Payment is only available after the technician completes the service.",
+        });
+      }
+
+      if (booking.paymentStatus === "paid") {
+        return res.status(400).json({
+          error: "This booking is already paid.",
+        });
+      }
+
+      // Load amount from DB (Never trust client sent amount!)
+      const amount = Number(booking.finalAmount || booking.amount || booking.basePrice);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ error: "Invalid booking amount." });
+      }
+
+      const unitAmountInCents = Math.round(amount * 100);
+
+      // If Stripe secret key is configured, create live Stripe Checkout Session
+      if (stripe) {
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: {
+                  name: `Mendizo Repair: ${booking.serviceTitle}`,
+                  description: `Technician: ${booking.technicianName} | Booking ID: ${booking._id}`,
+                },
+                unit_amount: unitAmountInCents,
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          customer_email: req.user.email,
+          success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${CLIENT_URL}/payment/cancel`,
+          metadata: {
+            bookingId: booking._id.toString(),
+            customerEmail: req.user.email,
+          },
+        });
+
+        return res.json({ url: session.url, sessionId: session.id });
+      } else {
+        // Fallback for development/testing if STRIPE_SECRET_KEY is not set
+        const mockSessionId = `mock_session_${Date.now()}_${randomBytes(4).toString("hex")}`;
+        return res.json({
+          url: `${CLIENT_URL}/payment/success?session_id=${mockSessionId}&mock=true&bookingId=${booking._id}`,
+          sessionId: mockSessionId,
+        });
+      }
+    } catch (error) {
+      console.error("POST create-checkout-session error:", error);
+      res.status(500).json({ error: "Unable to create payment session." });
+    }
+  }
+);
+
+// GET /api/payments/verify - Verify Stripe session and record payment
+app.get("/api/payments/verify", verifyToken, async (req, res) => {
+  try {
+    const { session_id, mock, bookingId: queryBookingId } = req.query;
+
+    if (!session_id) {
+      return res.status(400).json({ error: "session_id is required." });
+    }
+
+    let bookingId = "";
+    let customerEmail = req.user.email;
+    let paidAmount = 0;
+    let transactionId = "TXN-" + randomBytes(4).toString("hex").toUpperCase();
+    let isPaid = false;
+
+    if (mock === "true" || !stripe) {
+      bookingId = queryBookingId;
+      isPaid = true;
+    } else {
+      const session = await stripe.checkout.sessions.retrieve(String(session_id));
+      if (session && session.payment_status === "paid") {
+        isPaid = true;
+        bookingId = session.metadata?.bookingId;
+        customerEmail = session.metadata?.customerEmail || session.customer_email || req.user.email;
+        paidAmount = (session.amount_total || 0) / 100;
+        transactionId = typeof session.payment_intent === "string" ? session.payment_intent : transactionId;
+      }
+    }
+
+    if (!isPaid || !bookingId) {
+      return res.status(400).json({ error: "Payment verification failed or unpaid." });
+    }
+
+    const booking = await findByIdOrString(bookingsCol, bookingId);
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found." });
+    }
+
+    if (paidAmount === 0) {
+      paidAmount = Number(booking.finalAmount || booking.amount || booking.basePrice);
+    }
+
+    // Check if payment already recorded (idempotent / prevent double insert)
+    let payment = await paymentsCol.findOne({
+      $or: [
+        { stripeSessionId: String(session_id) },
+        { bookingId: booking._id.toString() },
+      ],
+    });
+
+    if (!payment) {
+      const paymentDoc = {
+        bookingId: booking._id.toString(),
+        serviceTitle: booking.serviceTitle,
+        customerName: booking.customerName,
+        customerEmail: booking.customerEmail,
+        technicianName: booking.technicianName,
+        technicianEmail: booking.technicianEmail,
+        amount: paidAmount,
+        currency: "usd",
+        transactionId,
+        stripeSessionId: String(session_id),
+        paymentStatus: "paid",
+        paidAt: new Date(),
+      };
+
+      const result = await paymentsCol.insertOne(paymentDoc);
+      payment = { ...paymentDoc, _id: result.insertedId };
+    }
+
+    // Update booking paymentStatus
+    await bookingsCol.updateOne(
+      { _id: booking._id },
+      { $set: { paymentStatus: "paid", updatedAt: new Date() } }
+    );
+
+    res.json({
+      success: true,
+      message: "Payment successfully verified and recorded.",
+      payment,
+      booking: { ...booking, paymentStatus: "paid" },
+    });
+  } catch (error) {
+    console.error("GET /api/payments/verify error:", error);
+    res.status(500).json({ error: "Payment verification error." });
+  }
+});
+
+// GET /api/customer/payments - Customer payment history
+app.get("/api/customer/payments", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const payments = await paymentsCol
+      .find({
+        $or: [
+          { customerEmail: req.user.email },
+          { customerId: req.userId },
+        ],
+      })
+      .sort({ paidAt: -1 })
+      .toArray();
+
+    const totalPaid = payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+
+    res.json({
+      payments,
+      totalPaid,
+    });
+  } catch (error) {
+    console.error("GET customer payments error:", error);
+    res.status(500).json({ error: "Unable to fetch payment history." });
+  }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
 
 async function startServer() {
   try {
