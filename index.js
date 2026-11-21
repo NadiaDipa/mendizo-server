@@ -790,41 +790,38 @@ app.post(
       const unitAmountInCents = Math.round(amount * 100);
 
       // If Stripe secret key is configured, create live Stripe Checkout Session
-      if (stripe) {
-        const session = await stripe.checkout.sessions.create({
-          payment_method_types: ["card"],
-          line_items: [
-            {
-              price_data: {
-                currency: "usd",
-                product_data: {
-                  name: `Mendizo Repair: ${booking.serviceTitle}`,
-                  description: `Technician: ${booking.technicianName} | Booking ID: ${booking._id}`,
-                },
-                unit_amount: unitAmountInCents,
-              },
-              quantity: 1,
-            },
-          ],
-          mode: "payment",
-          customer_email: req.user.email,
-          success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${CLIENT_URL}/payment/cancel`,
-          metadata: {
-            bookingId: booking._id.toString(),
-            customerEmail: req.user.email,
-          },
-        });
-
-        return res.json({ url: session.url, sessionId: session.id });
-      } else {
-        // Fallback for development/testing if STRIPE_SECRET_KEY is not set
-        const mockSessionId = `mock_session_${Date.now()}_${randomBytes(4).toString("hex")}`;
-        return res.json({
-          url: `${CLIENT_URL}/payment/success?session_id=${mockSessionId}&mock=true&bookingId=${booking._id}`,
-          sessionId: mockSessionId,
+      if (!stripe) {
+        return res.status(503).json({
+          error:
+            "Stripe is not configured on this server. Set STRIPE_SECRET_KEY in the server .env file to enable payments.",
         });
       }
+
+      const session = await stripe.checkout.sessions.create({
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: `Mendizo Repair: ${booking.serviceTitle}`,
+                description: `Technician: ${booking.technicianName} | Booking ID: ${booking._id}`,
+              },
+              unit_amount: unitAmountInCents,
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        customer_email: req.user.email,
+        success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${CLIENT_URL}/payment/cancel`,
+        metadata: {
+          bookingId: booking._id.toString(),
+          customerEmail: req.user.email,
+        },
+      });
+
+      return res.json({ url: session.url, sessionId: session.id });
     } catch (error) {
       console.error("POST create-checkout-session error:", error);
       res.status(500).json({ error: "Unable to create payment session." });
@@ -835,10 +832,17 @@ app.post(
 // GET /api/payments/verify - Verify Stripe session and record payment
 app.get("/api/payments/verify", verifyToken, async (req, res) => {
   try {
-    const { session_id, mock, bookingId: queryBookingId } = req.query;
+    const { session_id } = req.query;
 
     if (!session_id) {
       return res.status(400).json({ error: "session_id is required." });
+    }
+
+    if (!stripe) {
+      return res.status(503).json({
+        error:
+          "Stripe is not configured on this server. Set STRIPE_SECRET_KEY in the server .env file to enable payments.",
+      });
     }
 
     let bookingId = "";
@@ -847,10 +851,7 @@ app.get("/api/payments/verify", verifyToken, async (req, res) => {
     let transactionId = "TXN-" + randomBytes(4).toString("hex").toUpperCase();
     let isPaid = false;
 
-    if (mock === "true" || !stripe) {
-      bookingId = queryBookingId;
-      isPaid = true;
-    } else {
+    {
       const session = await stripe.checkout.sessions.retrieve(String(session_id));
       if (session && session.payment_status === "paid") {
         isPaid = true;
