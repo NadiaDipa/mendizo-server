@@ -26,7 +26,7 @@ export const auth = betterAuth({
   user: {
     additionalFields: {
       role: {
-        type: ["customer", "technician"],
+        type: "string",
         required: true,
         defaultValue: "customer",
         input: true,
@@ -55,9 +55,7 @@ export const auth = betterAuth({
         const role = ctx.body?.role;
 
         const normalizedRole =
-          role === "customer" || role === "technician"
-            ? role
-            : "customer";
+          role === "technician" ? "technician" : "customer";
 
         return {
           context: {
