@@ -4,7 +4,7 @@ import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import { randomBytes, createHmac } from "node:crypto";
 import Stripe from "stripe";
-import { fromNodeHeaders } from "better-auth/node";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { auth } from "./auth.js";
 
 const app = express();
@@ -227,6 +227,9 @@ app.use(
     credentials: true,
   })
 );
+
+// Better Auth API routes
+app.all("/api/auth/*", toNodeHandler(auth));
 
 // Ensure MongoDB is ready before handling ANY request (incl. Stripe webhook)
 app.use(async (req, res, next) => {
