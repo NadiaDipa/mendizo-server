@@ -1,7 +1,8 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { MongoClient, ObjectId } from "mongodb";
+import { ObjectId } from "mongodb";
+import { db, connectDb } from "./db.js";
 import { randomBytes, createHmac } from "node:crypto";
 import Stripe from "stripe";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
@@ -29,9 +30,6 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
-// MongoDB setup
-const client = new MongoClient(process.env.MONGODB_URI);
-
 let usersCol;
 let servicesCol;
 let bookingsCol;
@@ -44,10 +42,10 @@ let mongoPromise;
 async function connectToMongoDB() {
   if (!mongoPromise) {
     mongoPromise = (async () => {
-      await client.connect();
+      await connectDb();
       console.log("Successfully connected to MongoDB!");
 
-      const database = client.db("mendizo");
+      const database = db;
 
       usersCol = database.collection("user");
       servicesCol = database.collection("services");

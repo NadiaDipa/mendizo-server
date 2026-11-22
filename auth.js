@@ -1,13 +1,12 @@
 import "dotenv/config";
 
 import { betterAuth } from "better-auth";
-import { MongoClient } from "mongodb";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { createAuthMiddleware } from "better-auth/api";
+import { client, db, connectDb } from "./db.js";
 
-const client = new MongoClient(process.env.MONGODB_URI);
-
-const db = client.db("mendizo");
+// Make sure the shared client is connected before Better Auth is used.
+await connectDb();
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -35,8 +34,7 @@ export const auth = betterAuth({
   // Trusted client origin
   trustedOrigins: [process.env.CLIENT_URL || "http://localhost:3000"],
 
-  // Cross-domain cookies only in production (Vercel sets NODE_ENV=production).
-  // Locally (http://localhost) the default cookie settings are used.
+  // Cross-domain cookies only in production.
   advanced: isProduction
     ? {
         defaultCookieAttributes: {
