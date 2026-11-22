@@ -229,7 +229,7 @@ app.use(
 );
 
 // Better Auth API routes
-app.all("/api/auth/*", toNodeHandler(auth));
+app.all("/api/auth/*splat", toNodeHandler(auth));
 
 // Ensure MongoDB is ready before handling ANY request (incl. Stripe webhook)
 app.use(async (req, res, next) => {
