@@ -24,7 +24,7 @@ if (!process.env.BETTER_AUTH_SECRET) {
   throw new Error("BETTER_AUTH_SECRET is missing in .env file");
 }
 
-// Stripe setup (supports real test key or test mock mode)
+// Stripe setup
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
@@ -38,40 +38,53 @@ let bookingsCol;
 let paymentsCol;
 let contactMessagesCol;
 
+let mongoPromise;
+
+// Lazy + cached connection (works for both local server and Vercel serverless)
 async function connectToMongoDB() {
-  await client.connect();
-  console.log("Successfully connected to MongoDB!");
+  if (!mongoPromise) {
+    mongoPromise = (async () => {
+      await client.connect();
+      console.log("Successfully connected to MongoDB!");
 
-  const database = client.db("mendizo");
+      const database = client.db("mendizo");
 
-  usersCol = database.collection("user");
-  servicesCol = database.collection("services");
-  bookingsCol = database.collection("bookings");
-  paymentsCol = database.collection("payments");
-  contactMessagesCol = database.collection("contactMessages");
+      usersCol = database.collection("user");
+      servicesCol = database.collection("services");
+      bookingsCol = database.collection("bookings");
+      paymentsCol = database.collection("payments");
+      contactMessagesCol = database.collection("contactMessages");
 
-  // Create unique index on payments to prevent duplicate payments
-  await paymentsCol.createIndex(
-    { stripeSessionId: 1 },
-    {
-      unique: true,
-      partialFilterExpression: {
-        stripeSessionId: { $type: "string" },
-      },
-    }
-  );
+      // Unique indexes to prevent duplicate payments
+      await paymentsCol.createIndex(
+        { stripeSessionId: 1 },
+        {
+          unique: true,
+          partialFilterExpression: {
+            stripeSessionId: { $type: "string" },
+          },
+        }
+      );
 
-  await paymentsCol.createIndex(
-    { bookingId: 1 },
-    {
-      unique: true,
-      partialFilterExpression: {
-        bookingId: { $type: "string" },
-      },
-    }
-  );
+      await paymentsCol.createIndex(
+        { bookingId: 1 },
+        {
+          unique: true,
+          partialFilterExpression: {
+            bookingId: { $type: "string" },
+          },
+        }
+      );
 
-  console.log("MongoDB collections and indexes are ready!");
+      console.log("MongoDB collections and indexes are ready!");
+    })().catch((err) => {
+      // Reset so the next request can retry instead of reusing a failed promise
+      mongoPromise = null;
+      throw err;
+    });
+  }
+
+  return mongoPromise;
 }
 
 // Helper functions
@@ -215,6 +228,17 @@ app.use(
   })
 );
 
+// Ensure MongoDB is ready before handling ANY request (incl. Stripe webhook)
+app.use(async (req, res, next) => {
+  try {
+    await connectToMongoDB();
+    next();
+  } catch (error) {
+    console.error("MongoDB connection error:", error);
+    res.status(500).json({ error: "Database connection failed." });
+  }
+});
+
 // ───────────────────────────────────────────────────────────────────────────
 // STRIPE WEBHOOK (CHALLENGE 4) - Must be before express.json()
 // ───────────────────────────────────────────────────────────────────────────
@@ -240,7 +264,11 @@ app.post(
         console.error("Webhook signature verification failed:", err.message);
         return res.status(400).send(`Webhook Error: ${err.message}`);
       }
+    } else if (process.env.NODE_ENV === "production" || process.env.VERCEL) {
+      // Never accept unsigned webhooks in production
+      return res.status(400).send("Missing webhook signature or secret.");
     } else {
+      // Local development only
       try {
         event = JSON.parse(req.body.toString());
       } catch {
@@ -794,7 +822,6 @@ app.post(
 
       const unitAmountInCents = Math.round(amount * 100);
 
-      // If Stripe secret key is configured, create live Stripe Checkout Session
       if (!stripe) {
         return res.status(503).json({
           error:
@@ -1576,17 +1603,19 @@ app.patch("/api/users/profile", verifyToken, async (req, res) => {
   }
 });
 
-// Start Server
-async function startServer() {
-  try {
-    await connectToMongoDB();
-    app.listen(PORT, () => {
-      console.log(`Mendizo server listening on port ${PORT}`);
-    });
-  } catch (error) {
-    console.error("Server startup failed:", error);
-    process.exit(1);
-  }
-}
+// Vercel serverless export
+export default app;
 
-startServer();
+// Local development only
+if (!process.env.VERCEL) {
+  connectToMongoDB()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Mendizo server listening on port ${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Server startup failed:", error);
+      process.exit(1);
+    });
+}
