@@ -372,9 +372,14 @@ app.get("/api/services", async (req, res) => {
   try {
     const { search, category, serviceMode, sort, limit, page } = req.query;
 
+    // By default only available services are public (homepage behaviour).
+    // The All Services page opts in to include unavailable approved services so
+    // customers can see their availability badge before opening the details.
+    const includeUnavailable = req.query.includeUnavailable === "true";
+
     const query = {
       approvalStatus: "approved",
-      isAvailable: true,
+      ...(includeUnavailable ? {} : { isAvailable: true }),
     };
 
     // Server-side search by title or category

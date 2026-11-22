@@ -1,101 +1,166 @@
 # Mendizo — Backend API Server
 
-Express.js & MongoDB API server powering Mendizo (Category 006).
+**Express.js & MongoDB API Server**
 
----
+Mendizo's backend API powers the repair-service platform, handling authentication, role-based authorization, service management, booking workflows, payment processing, and administrative operations.
 
-## 🏗️ Architecture & Collections
+## 🏗️ Architecture & Database Collections
 
-The server operates on exactly 4 application-level MongoDB collections:
-1. `users`: Stores user profile and role (`customer`, `technician`, `admin`), integrated with BetterAuth.
-2. `services`: Stores repair services with approval status (`pending`, `approved`, `rejected`), availability toggle, and category classification.
-3. `bookings`: Stores repair jobs throughout their lifecycle with strict pipeline enforcement.
-4. `payments`: Stores idempotent Stripe transaction records with currency `usd` and payment status `paid`.
+The application uses four primary MongoDB collections:
 
----
+1. **`users`**: Stores user profiles and roles (`customer`, `technician`, `admin`), integrated with Better Auth.
+2. **`services`**: Stores repair service information, approval status (`pending`, `approved`, `rejected`), availability, and category details.
+3. **`bookings`**: Stores repair requests and tracks jobs throughout their lifecycle.
+4. **`payments`**: Stores Stripe transaction records, including payment status and currency (`usd`).
 
-## 🎯 Implementation of Assignment Challenges
+## 🎯 Core Implementations
 
-### Challenge 1: Server-Side Search, Filter & Sort (`GET /api/services`)
-- Server-side text search across `title`, `category`, and `description` via regex.
-- Multi-category matching for the 7 assignment categories (`Smartphone`, `Laptop & PC`, `AC`, `Refrigerator`, `TV`, `Washing Machine`, `Electrical`).
+### 1. Server-Side Search, Filter & Sort
+
+**Endpoint:** `GET /api/services`
+
+- Server-side text search across `title`, `category`, and `description` using regular expressions.
+- Category filtering across seven categories:
+  - Smartphone
+  - Laptop & PC
+  - AC
+  - Refrigerator
+  - TV
+  - Washing Machine
+  - Electrical
 - Service mode filtering (`Home Visit`, `Shop Drop-off`).
-- Server-side sorting (`newest`, `price-asc`, `price-desc`).
-- Server-side pagination (`page`, `limit=25`, returning `total`, `page`, `totalPages`).
-- Strict visibility filter: `{ approvalStatus: "approved", isAvailable: true }`.
+- Server-side sorting:
+  - `newest`
+  - `price-asc`
+  - `price-desc`
+- Server-side pagination using `page` and `limit` (25 items per page).
+- Returns pagination metadata: `total`, `page`, and `totalPages`.
+- Public service visibility is restricted to approved and available services by default.
 
-### Challenge 2: Custom Role & JWT Express Middlewares
-- `verifyToken`: Validates Bearer HMAC-SHA256 JWT tokens and BetterAuth session cookies. Missing or invalid tokens return HTTP 401.
-- `verifyCustomer`: Enforces `req.user.role === "customer"`. Unauthorized roles return HTTP 403.
-- `verifyTechnician`: Enforces `req.user.role === "technician"`. Unauthorized roles return HTTP 403.
-- `verifyAdmin`: Enforces `req.user.role === "admin"`. Unauthorized roles return HTTP 403.
+### 2. Custom Role-Based JWT & Express Middlewares
 
-### Challenge 3: Server-Enforced Job Status Pipeline & Business Logic
-- Allowed transitions only:
-  - `requested` → `accepted` or `rejected` or `cancelled`
-  - `accepted` → `in-progress`
-  - `in-progress` → `completed` (requires positive `finalAmount > 0`)
-- Ownership enforcement: Technicians can only act on their own assigned jobs; customers can only cancel their own requested bookings.
-- Duplicate active request prevention: A customer cannot submit another request for the same service while in `['requested', 'accepted', 'in-progress']`.
-- Self-booking prevention: A technician cannot request their own repair service.
-- Editing a service automatically resets `approvalStatus: "pending"`.
-- Admin cannot demote their own account.
+- **`verifyToken`**: Validates Bearer HMAC-SHA256 JWT tokens and Better Auth session cookies. Missing or invalid authentication returns HTTP 401.
+- **`verifyCustomer`**: Restricts access to users with the `customer` role.
+- **`verifyTechnician`**: Restricts access to users with the `technician` role.
+- **`verifyAdmin`**: Restricts access to users with the `admin` role.
+- Unauthorized role access returns HTTP 403.
 
-### Challenge 4: Stripe Checkout & Idempotent Webhook
-- `POST /api/payments/create-checkout-session`: Enforces status gate (`status === 'completed'` and `paymentStatus === 'unpaid'`). Loads `finalAmount` directly from MongoDB (never trusts client amount) in USD cents.
-- `GET /api/payments/verify`: Idempotent payment verification and recording to prevent double payments.
-- `POST /api/stripe/webhook`: Express raw body parser (`express.raw`), cryptographic signature verification via `stripe.webhooks.constructEvent`, handling `checkout.session.completed` events idempotently.
+### 3. Server-Enforced Booking Workflow & Business Logic
 
----
+Allowed booking status transitions:
 
-## 🛠️ Tech Stack & Dependencies
+| Current Status | Allowed Next Status |
+|---|---|
+| `requested` | `accepted`, `rejected`, `cancelled` |
+| `accepted` | `in-progress` |
+| `in-progress` | `completed` |
 
-- **Runtime**: Node.js
-- **Server Framework**: Express.js (`express`, `cors`, `cookie-parser`)
-- **Database**: MongoDB Atlas (`mongodb`)
-- **Authentication**: BetterAuth (`better-auth`)
-- **Payment Gateway**: Stripe SDK (`stripe`)
-- **Environment**: Dotenv (`dotenv`)
+Additional business rules:
 
----
+- Completing a booking requires a positive `finalAmount`.
+- Technicians can only manage their own assigned repair jobs.
+- Customers can only cancel their own bookings while the status is `requested`.
+- Duplicate active requests for the same service are prevented while an existing booking is in `requested`, `accepted`, or `in-progress` status.
+- Technicians cannot book their own repair services.
+- Editing a service resets its approval status to `pending`.
+- Admins cannot demote their own accounts.
+
+### 4. Stripe Checkout & Idempotent Payment Processing
+
+- **`POST /api/payments/create-checkout-session`**
+  - Allows payment only for completed and unpaid bookings.
+  - Retrieves `finalAmount` directly from MongoDB instead of trusting the client-provided amount.
+  - Converts the amount into USD cents for Stripe Checkout.
+
+- **`GET /api/payments/verify`**
+  - Verifies completed Stripe Checkout sessions.
+  - Records payment information idempotently to prevent duplicate payment records.
+
+- **`POST /api/stripe/webhook`**
+  - Uses Express raw body parsing with `express.raw`.
+  - Verifies Stripe webhook signatures using `stripe.webhooks.constructEvent`.
+  - Handles `checkout.session.completed` events with idempotent payment processing.
+
+## 🛠️ Tech Stack
+
+| Category | Technologies |
+|---|---|
+| Runtime | Node.js |
+| Framework | Express.js |
+| Middleware | CORS, Cookie Parser |
+| Database | MongoDB Atlas |
+| Authentication | Better Auth, JWT |
+| Payment Gateway | Stripe |
+| Environment Configuration | Dotenv |
 
 ## 🚀 Getting Started
 
-### 1. Environment Setup
+### 1. Clone the Repository
 
-Create a `.env` file in `mendizo-server/`:
+```bash
+git clone <your-server-repository-url>
+cd mendizo-server
+```
+
+### 2. Install Dependencies
+
+```bash
+npm install
+```
+
+### 3. Configure Environment Variables
+
+Create a `.env` file in the project root:
 
 ```env
 PORT=5000
 MONGODB_URI=your_mongodb_connection_string
-BETTER_AUTH_SECRET=your_better_auth_secret_here
-STRIPE_SECRET_KEY=your_stripe_secret_key_here
-STRIPE_WEBHOOK_SECRET=your_stripe_webhook_secret_here
+BETTER_AUTH_SECRET=your_better_auth_secret
+STRIPE_SECRET_KEY=your_stripe_secret_key
+STRIPE_WEBHOOK_SECRET=your_stripe_webhook_secret
 CLIENT_URL=http://localhost:3000
 ```
 
-### 2. Install & Seed
+### 4. Seed the Database
 
 ```bash
-# Install dependencies
-npm install
-
-# Seed Admin, Technicians, Customer, 14 Services, and Sample Bookings
 node seed.js
+```
 
-# Start API server
+The seed script populates the database with demo users, services, and sample bookings.
+
+### 5. Start the API Server
+
+```bash
 node index.js
 ```
 
-Server runs on [http://localhost:5000](http://localhost:5000).
+The backend API runs at:
+
+[http://localhost:5000](http://localhost:5000)
+
+## 🔑 Seed Demo Accounts
+
+The seed script provides demo accounts for testing the different user roles.
+
+| Role | Demo Email |
+|---|---|
+| Admin | `admin@mendizo.com` |
+| Technician | `rafiqul.tech@mendizo.com` |
+| Technician | `tanvir.tech@mendizo.com` |
+| Technician | `sumon.tech@mendizo.com` |
+| Customer | `customer@mendizo.com` |
+
+Demo passwords should be shared separately, not committed to a public repository.
+
+## 🔒 Security Notes
+
+- Keep `.env` files and all API keys private.
+- Never expose Stripe secret keys or webhook secrets in client-side code.
+- Validate authentication, user roles, and resource ownership on the server.
+- Never trust payment amounts supplied by the client.
+- Verify Stripe webhook signatures before processing payment events.
 
 ---
 
-## 🔑 Seed Test Accounts
-
-- **Admin**: `admin@mendizo.com` / `admin@fixmate.com` (Password: `Admin@1234`)
-- **Technicians**:
-  - `rafiqul.tech@mendizo.com` / `rafiqul.tech@fixmate.com` (Password: `Tech@1234`)
-  - `tanvir.tech@mendizo.com` / `tanvir.tech@fixmate.com` (Password: `Tech@1234`)
-  - `sumon.tech@mendizo.com` / `sumon.tech@fixmate.com` (Password: `Tech@1234`)
-- **Customer**: `customer@mendizo.com` / `customer@fixmate.com` (Password: `Cust@1234`)
+**Mendizo — Making Home Repairs Easier.**
